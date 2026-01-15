@@ -1,0 +1,235 @@
+import os
+import json
+from neo4j import GraphDatabase
+
+URI = "bolt://127.0.0.1:7687"
+USER = "neo4j"
+PASSWORD = "123456789"
+
+son_sonuclar = []
+secilen_film = None
+
+def baglan():
+    try:
+        drv = GraphDatabase.driver(URI, auth=(USER, PASSWORD))
+        with drv.session() as s:
+            s.run("RETURN 1").single()
+        return drv
+    except Exception as e:
+        print("\nHATA! Neo4j veritabanina baglanilamadi.")
+        print("Kontrol et: Neo4j acik mi? URI/USER/PASSWORD dogru mu?")
+        print("Detay:", str(e))
+        return None
+
+def film_ara(drv, kelime):
+    cypher = """
+    MATCH (m:Movie)
+    WHERE toLower(m.title) CONTAINS toLower($k)
+    RETURN m.title AS title, m.released AS released
+    ORDER BY released ASC, title ASC
+    LIMIT 50
+    """
+    with drv.session() as s:
+        r = s.run(cypher, k=kelime)
+        liste = []
+        for rec in r:
+            liste.append({"title": rec["title"], "released": rec["released"]})
+        return liste
+
+def film_detay(drv, baslik):
+    cypher = """
+    MATCH (m:Movie {title:$t})
+    OPTIONAL MATCH (m)<-[:DIRECTED]-(d:Person)
+    OPTIONAL MATCH (p:Person)-[:ACTED_IN]->(m)
+    RETURN m.title AS title,
+           m.released AS released,
+           m.tagline AS tagline,
+           collect(DISTINCT d.name) AS directors,
+           collect(DISTINCT p.name) AS actors
+    """
+    with drv.session() as s:
+        rec = s.run(cypher, t=baslik).single()
+        if rec is None:
+            return None
+
+        yon = rec["directors"] if rec["directors"] else []
+        act = rec["actors"] if rec["actors"] else []
+
+        return {
+            "title": rec["title"],
+            "released": rec["released"],
+            "tagline": rec["tagline"],
+            "directors": yon,
+            "actors": act[:5]
+        }
+
+def graph_json(drv, baslik):
+    cypher = """
+    MATCH (m:Movie {title:$t})
+    OPTIONAL MATCH (p:Person)-[r:ACTED_IN|DIRECTED]->(m)
+    RETURN m, p, type(r) AS relType
+    """
+    with drv.session() as s:
+        r = s.run(cypher, t=baslik)
+
+        nodes = []
+        links = []
+        ids = {}
+        sayac = 0
+
+        def node_ekle(tip, etiket):
+            nonlocal sayac
+            anahtar = tip + ":" + str(etiket)
+            if anahtar in ids:
+                return ids[anahtar]
+            ids[anahtar] = sayac
+            nodes.append({"id": sayac, "label": etiket, "type": tip})
+            sayac += 1
+            return ids[anahtar]
+
+        film_id = node_ekle("Movie", baslik)
+
+        for rec in r:
+            p = rec["p"]
+            rel = rec["relType"]
+            if p is None or rel is None:
+                continue
+
+            isim = p.get("name", "Unknown")
+            kisi_id = node_ekle("Person", isim)
+            links.append({"source": kisi_id, "target": film_id, "type": rel})
+
+        return {"nodes": nodes, "links": links}
+
+def klasor_hazirla():
+    if not os.path.exists("exports"):
+        os.makedirs("exports")
+
+def film_sec(liste):
+    if not liste:
+        return None
+
+    while True:
+        sec = input("Film seciniz (numara) veya 0 ile iptal: ").strip()
+        if sec == "0":
+            return None
+        if not sec.isdigit():
+            print("UYARI! Lutfen sadece numara giriniz.")
+            continue
+
+        i = int(sec)
+        if i < 1 or i > len(liste):
+            print("UYARI! Gecersiz secim. Tekrar deneyiniz.")
+            continue
+
+        return liste[i - 1]
+
+def menu_yaz():
+    print("\n===== MovieGraphPy (Neo4j) =====")
+    print("Komutlar: ara / detay / json / cikis")
+
+def main():
+    global son_sonuclar, secilen_film
+
+    drv = baglan()
+    if drv is None:
+        return
+
+    print("\nOK! Baglanti basarili. Neo4j Movies veri seti kullaniliyor.")
+
+    while True:
+        menu_yaz()
+        komut = input("Komut giriniz: ").strip().lower()
+
+        if komut == "ara":
+            kelime = input("Aranacak film adini giriniz: ").strip()
+            if kelime == "":
+                print("UYARI! Bos arama yapilamaz.")
+                continue
+
+            try:
+                son_sonuclar = film_ara(drv, kelime)
+            except Exception as e:
+                print("HATA! Arama sirasinda hata olustu:", str(e))
+                continue
+
+            if len(son_sonuclar) == 0:
+                print("Sonuc bulunamadi.")
+                secilen_film = None
+                continue
+
+            print("\n--- Arama Sonuclari ---")
+            for i in range(len(son_sonuclar)):
+                m = son_sonuclar[i]
+                yil = m["released"] if m["released"] is not None else "Bilinmiyor"
+                print(str(i + 1) + ") " + m["title"] + " (" + str(yil) + ")")
+
+            secilen_film = film_sec(son_sonuclar)
+            if secilen_film is None:
+                print("Secim iptal edildi.")
+            else:
+                print("OK! Secilen film:", secilen_film["title"])
+
+        elif komut == "detay":
+            if secilen_film is None:
+                print("UYARI! Once 'ara' komutuyla bir film secmelisiniz.")
+                continue
+
+            try:
+                d = film_detay(drv, secilen_film["title"])
+            except Exception as e:
+                print("HATA! Detay alinirken hata olustu:", str(e))
+                continue
+
+            if d is None:
+                print("UYARI! Film bulunamadi.")
+                secilen_film = None
+                continue
+
+            print("\n--- Film Detayi ---")
+            print("Film Adi:", d["title"])
+            print("Yayin Yili:", d["released"] if d["released"] is not None else "Bilinmiyor")
+
+            if d["tagline"] is None or str(d["tagline"]).strip() == "":
+                print("Slogan (Tagline): Yok")
+            else:
+                print("Slogan (Tagline):", d["tagline"])
+
+            if d["directors"]:
+                print("Yonetmen(ler):", ", ".join(d["directors"]))
+            else:
+                print("Yonetmen(ler): Yok")
+
+            if d["actors"]:
+                print("Oyuncular (ilk 5):", ", ".join(d["actors"]))
+            else:
+                print("Oyuncular: Yok")
+
+        elif komut == "json":
+            if secilen_film is None:
+                print("UYARI! Once 'ara' komutuyla bir film secmelisiniz.")
+                continue
+
+            try:
+                g = graph_json(drv, secilen_film["title"])
+                klasor_hazirla()
+                yol = os.path.join("exports", "graph.json")
+                with open(yol, "w", encoding="utf-8") as f:
+                    json.dump(g, f, ensure_ascii=False, indent=2)
+                print("OK! graph.json dosyasi olusturuldu:", yol)
+            except Exception as e:
+                print("HATA! JSON olusturulurken hata olustu:", str(e))
+
+        elif komut == "cikis":
+            print("Program kapatiliyor...")
+            break
+
+        else:
+            print("UYARI! Hatali komut girdiniz. Tekrar deneyiniz.")
+
+    try:
+        drv.close()
+    except:
+        pass
+
+main()
